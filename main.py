@@ -3,13 +3,13 @@ Description: Entry-point for the simulated Traffic Light Detection & Control app
              Manages the main client connection loop with the simulator, extracts camera frames, 
              pipes data through the CV pipeline, and pushes vehicle control commands back to the server.
 """
-
-from glob import glob
+import glob
 import os
 
 import cv2
 import sys
-from src.preprocessing import apply_gaussian_blur, convert_color_space
+import time
+from src.preprocessing import apply_gaussian_blur
 from src.detection import TrafficLightDetector
 from src.tracking import TrafficLightTracker
 from src.control import VehicleControlUnit
@@ -28,16 +28,23 @@ def main():
     """
     
     # Path for testing with a local video file
-    image_folder = "data/2011_10_03/2011_10_03_drive_0042_sync/image_02/data"
+    image_folder = "data/2011_09_26/2011_09_26_drive_0001_sync/image_02/data"
     image_paths = sorted(glob.glob(os.path.join(image_folder, "*.png")))
 
     if not image_paths:
         print(f"Error: Could not find any PNG images in path: {image_folder}")
         sys.exit(1)
     
-    detector = TrafficLightDetector(model_path='yolov8n.pt') # trained YOLO model 
+    detector = TrafficLightDetector(model_path='yolov8n.pt')
     tracker = TrafficLightTracker()
     vcu = VehicleControlUnit()
+    # User-configurable VCU distances: estimated mapping and stop threshold
+    vcu.max_distance = 60.0
+    vcu.max_stop_distance = 5.0
+    prev_control = None
+    smoothing_alpha = 0.20
+    stop_distance = 5.0  # meters — user-configurable stop threshold
+    pause_duration = 60.0  # seconds to pause when stopping
 
     print("Starting simulation loop. Press 'q' to exit.")
 
@@ -49,31 +56,74 @@ def main():
         # preprocessing
 
         blurred_frame = apply_gaussian_blur(frame, kernel_size=(5, 5))
-        processed_frame = convert_color_space(blurred_frame, target_space="RGB")
 
         # detection
 
-        detections = detector.detect(processed_frame, confidence_threshold=0.5)
+        # lower confidence to increase sensitivity for small/distant lights
+        detections = detector.detect(blurred_frame, confidence_threshold=0.15)
+        if not detections:
+            print(f"No traffic light detections in frame: {os.path.basename(img_path)}")
 
         # tracking
 
-        tracker.predinct()
+        tracker.predict()
         if len(detections) > 0:
             tracker.update(detections[0]['box'])
         
         # control
 
-        target_light = vcu.select_relevant_traffic_light(detections)
+        target_light = vcu.select_relevant_traffic_light(detections, lane_info={'image_shape': frame.shape})
         control_payload = vcu.generate_command(target_light)
+
+        # apply simple exponential smoothing to throttle/brake so the vehicle slows gradually
+        if prev_control is None:
+            prev_control = control_payload.copy()
+        else:
+            th_prev = prev_control.get('throttle', 0.0)
+            br_prev = prev_control.get('brake', 0.0)
+            th_new = control_payload.get('throttle', 0.0)
+            br_new = control_payload.get('brake', 0.0)
+            sm_th = th_prev * (1.0 - smoothing_alpha) + th_new * smoothing_alpha
+            sm_br = br_prev * (1.0 - smoothing_alpha) + br_new * smoothing_alpha
+            control_payload['throttle'] = float(sm_th)
+            control_payload['brake'] = float(sm_br)
+            prev_control = control_payload.copy()
+
+        # if we need to stop and we're very close to the detected red light, halt and pause
+        try:
+            close_dist = float(control_payload.get('distance_to_light', float('inf')))
+        except Exception:
+            close_dist = float('inf')
+        # if control_payload.get('action') == 'STOP' and close_dist <= stop_distance:
+        #     print("STOP")
+        #     # enforce a full stop in the simulated control payload
+        #     control_payload['action'] = 'STOP'
+        #     control_payload['throttle'] = 0.0
+        #     control_payload['brake'] = 1.0
+        #     # draw STOP, action, and telemetry on the frame so UI shows real stop state
+        #     cv2.putText(frame, "STOP", (frame.shape[1] // 2 - 120, frame.shape[0] // 2), cv2.FONT_HERSHEY_SIMPLEX, 2.5, (0, 0, 255), 6)
+        #     action_text = f"ACTION: {control_payload['action']}"
+        #     telemetry_text = f"Throttle: {control_payload['throttle']:.2f}, Brake: {control_payload['brake']:.2f}, Handbrake: {control_payload['handbrake']}, Distance to Light: {control_payload['distance_to_light']:.2f}m"
+        #     cv2.putText(frame, action_text, (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
+        #     cv2.putText(frame, telemetry_text, (30, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        #     end_time = time.time() + pause_duration
+        #     while time.time() < end_time:
+        #         cv2.imshow("Traffic Light Detection - Video Simulation", frame)
+        #         # wait a short time to keep GUI responsive; allow user to press 'q' to abort early
+        #         if cv2.waitKey(100) & 0xFF == ord('q'):
+        #             print("User requested exit during STOP")
+        #             break
+        #     print("Exiting simulation loop after STOP")
+        #     break
 
         # visualization for testing
 
         for det in detections:
             # draw bounding box and label on the frame
-            xmin, xmax, yminn, ymax = map(int, det['box'])
+            xmin, ymin, xmax, ymax = map(int, det['box'])
             label = f"{det['class']} ({det['conf']:.2f})"
-            cv2.rectangle(frame, (xmin, yminn), (xmax, ymax), (0, 255, 0), 2)
-            cv2.putText(frame, label, (xmin, yminn - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), (0, 255, 0), 2)
+            cv2.putText(frame, label, (xmin, max(0, ymin - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
         action_text = f"ACTION: {control_payload['action']}"
         telemetry_text = f"Throttle: {control_payload['throttle']:.2f}, Brake: {control_payload['brake']:.2f}, Handbrake: {control_payload['handbrake']}, Distance to Light: {control_payload['distance_to_light']:.2f}m"
@@ -93,34 +143,4 @@ def main():
 if __name__ == "__main__":
     main()
 
-#TODO 1 preprocessing: in apply_gaussian_blur: Apply a standard blur filter (cv2.GaussianBlur) using the given frame, kernel size, 
-# and sigma value to clean up pixel noise.
 
-#TODO 2 preprocessing: n convert_color_space: Look at the target_space text. If it says "RGB", 
-# convert the frame from BGR to RGB (cv2.COLOR_BGR2RGB). If it says "HSV", convert it to HSV. Return the converted image.
-
-#TODO 3 detection: in __init__: Load the neural network model by passing the model_path string into the YOLO() framework, 
-# and save it inside self.model.
-
-#TODO 4 detection: in detect: Pass the image frame to the YOLO model. 
-# Loop through all objects found by the AI. If the object class is a traffic light (Class ID 9) and its score is higher than the 
-# confidence_threshold, extract its bounding box corners [xmin, ymin, xmax, ymax] and add them to your results list.
-
-#TODO 5 tracking:  in __init__: Set up the internal math for the KalmanFilter to track position and speed ($x, y, vx, vy$). 
-# Initialize the state transition matrix ($F$) and measurement matrix ($H$) based on the video frame timing ($dt$).
-
-#TODO 6 tracking: in predict: Run the filter's built-in prediction step (self.kf.predict()) to estimate where the traffic light should be 
-# in the current frame. Return the estimated coordinates.
-
-#TODO 7 tracking: in update: Find the middle point ($x, y$) of the bounding box coordinates given by YOLO. 
-# Send this point to the filter's update function (self.kf.update()) to correct the tracker's accuracy. Return the corrected coordinates.
-
-#TODO 8 control: in select_relevant_traffic_light:
-# Use the image dimensions to define a virtual "Driving Corridor" (the area in the middle of the screen where your lane is). 
-# Calculate which traffic light box is closest to this lane center and ignore lights that are on side streets or other lanes.
-
-#TODO 9 control: in generate_command: Look at the size (width and height) of the chosen traffic light's box. 
-# As the box gets larger (meaning the car is getting closer to the light in the video), 
-# use a mathematical formula to slowly increase the brake value and decrease the throttle value to create a smooth stopping motion on screen.
-
-# DEPENDENCIES: opencv-python, ultralytics, filterpy, and numpy.

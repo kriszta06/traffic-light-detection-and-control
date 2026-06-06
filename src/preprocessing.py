@@ -22,7 +22,7 @@ def apply_gaussian_blur(image, kernel_size=(5, 5), sigma=0):
         Even in high-fidelity simulators, perfect digital edges can sometimes cause overfitting in CNNs; 
         a slight blur helps generalize the features.
     """
-    pass
+    return cv2.GaussianBlur(image, kernel_size, sigma)
 
 def convert_color_space(image, target_space="RGB"):
     """
@@ -39,4 +39,9 @@ def convert_color_space(image, target_space="RGB"):
         Simulators often export frames in BGR or RGBA. Conversion to RGB is mandatory before feeding 
         the image to standard deep learning backbones like YOLO.
     """
-    pass
+    normalized_space = target_space.upper()
+    if normalized_space == "RGB":
+        return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    if normalized_space == "HSV":
+        return cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    raise ValueError(f"Unsupported target color space: {target_space}")
