@@ -14,14 +14,14 @@ class VehicleControlUnit:
         # temporal confirmation counts for detected objects (bucketed center keys)
         self.confirm_counts = {}
         self.confirm_tolerance = 8.0
-        self.min_confirm_frames = 1
+        self.min_confirm_frames = 4
         # mapping parameters: estimated max distance (meters) for smallest detections
         self.max_distance = 60.0
         # reference area used to compute size_factor; smaller value -> distance decreases earlier
         # reference area used to compute size_factor; larger value -> distance decreases later
-        self.area_ref = 8000.0
+        self.area_ref = 50000.0
         self.area_max = 1000000.0
-        self.stop_area_pixels = 5000.0
+        self.stop_area_pixels = 20000.0
         self.max_stop_distance = 5.0
 
     def select_relevant_traffic_light(self, tracked_objects, lane_info=None):
@@ -68,14 +68,9 @@ class VehicleControlUnit:
             if center_x < corridor_left or center_x > corridor_right:
                 continue
             cls = obj.get('class', 'Traffic_Light')
-            # accept small lights if they are red or yellow (we want to stop for them)
-            if cls in ('Red_Light', 'Yellow_Light'):
-                min_area = 10.0
-            else:
-                min_area = 200.0
+            min_area = 10.0 if cls in ('Red_Light', 'Yellow_Light') else 200.0
             if area < min_area:
                 continue
-            # priority: prefer red/yellow over others, then larger area, then closer to bottom (smaller ymin)
             priority = 0 if cls in ('Red_Light', 'Yellow_Light') else 1
             valid_candidates.append((priority, -area, ymin, abs(center_x - lane_center_x), obj))
 
@@ -90,9 +85,7 @@ class VehicleControlUnit:
             for obj in tracked_objects:
                 box = obj.get('box', [0, 0, 0, 0])
                 xmin, ymin, xmax, ymax = box
-                box_width = max(0.0, xmax - xmin)
-                box_height = max(0.0, ymax - ymin)
-                area = box_width * box_height
+                area = max(0.0, xmax - xmin) * max(0.0, ymax - ymin)
                 cls = obj.get('class', 'Traffic_Light')
                 if cls in ('Red_Light', 'Yellow_Light') and area >= 8.0:
                     # prefer larger area and closer to bottom
@@ -103,7 +96,8 @@ class VehicleControlUnit:
                 xmin, ymin, xmax, ymax = chosen.get('box', [0, 0, 0, 0])
                 center_x = (xmin + xmax) / 2.0
                 center_y = (ymin + ymax) / 2.0
-                key = (int(center_x // self.confirm_tolerance), int(center_y // self.confirm_tolerance))
+                key = (int(center_x // self.confirm_tolerance), 
+                       int(center_y // self.confirm_tolerance))
                 confirmed = self.confirm_counts.get(key, 0) >= self.min_confirm_frames
                 chosen['confirmed'] = bool(confirmed)
                 return chosen
@@ -114,93 +108,105 @@ class VehicleControlUnit:
         xmin, ymin, xmax, ymax = chosen.get('box', [0, 0, 0, 0])
         center_x = (xmin + xmax) / 2.0
         center_y = (ymin + ymax) / 2.0
-        key = (int(center_x // self.confirm_tolerance), int(center_y // self.confirm_tolerance))
+        key = (int(center_x // self.confirm_tolerance), 
+               int(center_y // self.confirm_tolerance))
         confirmed = self.confirm_counts.get(key, 0) >= self.min_confirm_frames
-        chosen['confirmed'] = bool(confirmed)
+        chosen['confirmed'] = self.confirm_counts.get(key, 0) >= self.min_confirm_frames
         return chosen
 
     def generate_command(self, target_light):
-        """
-        Translates the classified color state of the relevant traffic light into discrete or continuous control signals.
+            """
+            Translates the classified color state of the relevant traffic light into discrete or continuous control signals.
 
-        Parameters:
-            target_light (dict): The filtered target traffic light containing its current state.
+            Parameters:
+                target_light (dict): The filtered target traffic light containing its current state.
 
-        Returns:
-            dict: A control payload containing actuation values (e.g., action: str, throttle: float, brake: float).
+            Returns:
+                dict: A control payload containing actuation values (e.g., action: str, throttle: float, brake: float).
+            """
+            # Comanda implicită în caz că nu există semafor în zonă
+            control = {'action': 'GO', 'throttle': 0.6, 'brake': 0.0, 'handbrake': False, 'distance_to_light': float('inf')}
 
-        Note:
-            When a 'Red' or 'Yellow' state is detected, the logic simulates a brake command payload.
-        """
-        if target_light is None:
-            return {
-                'action': 'GO',
-                'throttle': 0.6,
-                'brake': 0.0,
-                'handbrake': False,
-                'distance_to_light': float('inf'),
-            }
+            if not target_light:
+                return control
+            
+            state = target_light.get('class', 'Unknown')
+            xmin, ymin, xmax, ymax = target_light.get('box', [0.0, 0.0, 0.0, 0.0])
+            area = float((xmax - xmin) * (ymax - ymin))
 
-        xmin, ymin, xmax, ymax = target_light.get('box', [0.0, 0.0, 0.0, 0.0])
-        width = max(1.0, xmax - xmin)
-        height = max(1.0, ymax - ymin)
-        area = width * height
-        # compute size factor relative to reference area, then use sqrt scaling
-        # clamp area to avoid false huge-area detections dominating mapping
-        area_clamped = min(area, float(self.area_max))
-        size_factor = min(1.0, area_clamped / float(self.area_ref))
-        distance_to_light = max(0.0, self.max_distance * (1.0 - (size_factor ** 0.5)))
+            # FILTRU CRITIC DE ZGOMOT: Ignorăm artefactele minuscule (sub 15px) ca să nu frânăm aiurea
+            if area < 15.0:
+                return control
 
-        state = target_light.get('class', 'Traffic_Light')
-        control = {
-            'action': 'GO',
-            'throttle': 0.6,
-            'brake': 0.0,
-            'handbrake': False,
-            'distance_to_light': distance_to_light,
-        }
+            size_factor = min(1.0, area / self.area_ref)
+            distance_to_light = max(2.0, 60.0 * (1.0 - (area / 2000.0)**0.3))
+            
+            # Ajustare distanță empirică dacă obiectul ocupă mult spațiu pe ecran
+            if area > 800.0:
+                distance_to_light = min(distance_to_light, 4.5)
 
-        # pixel-area fallback: if a confirmed red light is large enough on-screen, force stop
-        if state == 'Red_Light' and target_light.get('confirmed', False) and area >= self.stop_area_pixels:
-            control['action'] = 'STOP'
-            control['throttle'] = 0.0
-            control['brake'] = 1.0
-            print(f"VCU DEBUG: FORCED STOP by pixel area={area:.1f} >= {self.stop_area_pixels}")
+            control['distance_to_light'] = distance_to_light
+
+            try:
+                confirmed_flag = bool(target_light.get('confirmed', False))
+            except Exception:
+                confirmed_flag = False
+
+            # Debug corectat (am eliminat 'area_clamped' care genera NameError)
+            print(f"VCU DEBUG: state={state}, area={area:.1f}, size_factor={size_factor:.3f}, distance={distance_to_light:.2f}, confirmed={confirmed_flag}")
+
+            # =========================================================================
+            # LOGICA DE DECIZIE UNIFICATĂ (Fără riscuri de suprascriere)
+            # =========================================================================
+            
+            # 1. COMANDA DE URGENȚĂ (Safety Fallback): Dacă suntem extrem de aproape sau semaforul e imens
+            if area > 600.0 or distance_to_light <= self.max_stop_distance:
+                # Dacă e roșu/galben SAU dacă e atât de aproape încât clasificatorul de culoare dă rateuri (ex: Green_Light din greșeală)
+                if state in ['Red_Light', 'Yellow_Light', 'Traffic_Light'] or area > 600.0:
+                    control['action'] = 'STOP'
+                    control['throttle'] = 0.0
+                    control['brake'] = 1.0
+                    control['handbrake'] = True
+                    control['distance_to_light'] = min(distance_to_light, 5.0) # Forțăm afișarea distanței de oprire
+                    return control # Oprim execuția aici ca să nu poată fi suprascrisă!
+
+            # 2. LOGICA DE DEPLASARE NORMALĂ (Când semaforul e încă la distanță sigură)
+            if state == 'Red_Light':
+                if confirmed_flag and distance_to_light <= self.max_stop_distance:
+                    control['action'] = 'STOP'
+                    control['throttle'] = 0.0
+                    control['brake'] = 1.0
+                else:
+                    control['action'] = 'CAUTION'
+                    control['throttle'] = max(0.0, 0.35 * (1.0 - size_factor))
+                    control['brake'] = min(1.0, 0.25 * size_factor)
+
+            elif state == 'Yellow_Light':
+                if confirmed_flag and distance_to_light <= self.max_stop_distance:
+                    control['action'] = 'STOP'
+                    control['throttle'] = 0.0
+                    control['brake'] = 1.0
+                else:
+                    control['action'] = 'CAUTION'
+                    control['throttle'] = max(0.0, 0.4 * (1.0 - size_factor))
+                    control['brake'] = min(1.0, 0.15 + 0.65 * size_factor)
+
+            elif state == 'Green_Light':
+                control['action'] = 'GO'
+                # Dacă semaforul e măricel, reducem puțin viteza preventiv
+                control['throttle'] = 0.4 if area > 400.0 else min(1.0, 0.5 + 0.35 * size_factor)
+                control['brake'] = 0.0
+
+            else: # Pentru clasa generică 'Traffic_Light' fără culoare detectată clar de masca HSV
+                if area > 200.0:
+                    control['action'] = 'CAUTION'
+                    control['throttle'] = 0.2
+                    control['brake'] = 0.2
+                else:
+                    control['action'] = 'GO'
+                    control['throttle'] = max(0.0, 0.55 - 0.25 * size_factor)
+                    control['brake'] = min(1.0, 0.1 + 0.25 * size_factor)
+
+            # Activăm frâna de mână automată la decelerări masive
+            control['handbrake'] = control['brake'] > 0.9
             return control
-
-        # debug output to help tune distance mapping and confirmation
-        try:
-            confirmed_flag = bool(target_light.get('confirmed', False))
-        except Exception:
-            confirmed_flag = False
-        print(f"VCU DEBUG: state={state}, area={area:.1f}, area_clamped={area_clamped:.1f}, size_factor={size_factor:.3f}, distance={distance_to_light:.2f}, confirmed={confirmed_flag}")
-        if state == 'Red_Light':
-            # require temporal confirmation and proximity before a full STOP to reduce false positives
-            if target_light.get('confirmed', True) and distance_to_light <= self.max_stop_distance:
-                control['action'] = 'STOP'
-                control['throttle'] = max(0.0, 0.5 * (1.0 - size_factor))
-                control['brake'] = min(1.0, 0.2 + 0.8 * size_factor)
-            else:
-                control['action'] = 'CAUTION'
-                control['throttle'] = max(0.0, 0.35 * (1.0 - size_factor))
-                control['brake'] = min(1.0, 0.25 * size_factor)
-        elif state == 'Yellow_Light':
-            if target_light.get('confirmed', True) and distance_to_light <= self.max_stop_distance:
-                control['action'] = 'STOP'
-                control['throttle'] = 0.0
-                control['brake'] = 1.0
-            else:
-                control['action'] = 'CAUTION'
-                control['throttle'] = max(0.0, 0.4 * (1.0 - size_factor))
-                control['brake'] = min(1.0, 0.15 + 0.65 * size_factor)
-        elif state == 'Green_Light':
-            control['action'] = 'GO'
-            control['throttle'] = min(1.0, 0.5 + 0.35 * size_factor)
-            control['brake'] = max(0.0, 0.05 * size_factor)
-        else:
-            control['action'] = 'GO'
-            control['throttle'] = max(0.0, 0.55 - 0.25 * size_factor)
-            control['brake'] = min(1.0, 0.1 + 0.25 * size_factor)
-
-        control['handbrake'] = control['brake'] > 0.9
-        return control

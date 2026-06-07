@@ -21,11 +21,8 @@ class TrafficLightDetector:
         """
         self.model = YOLO(model_path)
         self.traffic_light_class_id = 9
-        self.color_ranges = {
-            'Red_Light': [(0, 70, 50), (10, 255, 255), (170, 255, 255)],
-            'Yellow_Light': [(15, 70, 50), (35, 255, 255)],
-            'Green_Light': [(36, 70, 50), (85, 255, 255)],
-        }
+        self.area_ref = 50000.0
+        self.stop_area_pixels = 20000.0
         
     def detect(self, frame, confidence_threshold=0.5):
         """
@@ -47,7 +44,7 @@ class TrafficLightDetector:
             return []
 
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = self.model(rgb_frame, imgsz=1280, conf=confidence_threshold)
+        results = self.model(rgb_frame, imgsz=640, conf=confidence_threshold)
         detections = []
         for result in results:
             if result.boxes is None or len(result.boxes) == 0:
@@ -104,26 +101,30 @@ class TrafficLightDetector:
     def _color_fallback(self, frame):
         """Fallback traffic light detection for distant or low-confidence lights."""
         height, width = frame.shape[:2]
-        # expand ROI to cover more of the frame where distant lights appear (top + center)
-        roi = frame[0:int(height * 0.6), 0:width]
+        # optimize ROI to reduce processing overhead while still catching distant lights
+        roi_y_end = int(height * 0.65)
+        roi_x_start = int(width * 0.25)
+        roi_x_end = int(width * 0.75)
+        
+        roi = frame[0:roi_y_end, roi_x_start:roi_x_end]
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
 
         color_ranges = {
             # lower sat/val lower-bounds to be more sensitive to dim/distant lights
             'Red_Light': [
-                (np.array([0, 60, 60]), np.array([18, 255, 255])),
-                (np.array([150, 60, 60]), np.array([179, 255, 255])),
+                (np.array([0, 120, 120]), np.array([10, 255, 255])),
+                (np.array([160, 120, 120]), np.array([179, 255, 255])),
             ],
             'Yellow_Light': [
-                (np.array([12, 80, 80]), np.array([40, 255, 255])),
+                (np.array([18, 120, 120]), np.array([35, 255, 255])),
             ],
             'Green_Light': [
-                (np.array([36, 80, 80]), np.array([95, 255, 255])),
+                (np.array([40, 120, 120]), np.array([90, 255, 255])),
             ],
         }
 
-        best_detection = None
-        best_area = 0
+        all_detections = []
+
         for label, ranges in color_ranges.items():
             mask = None
             for lower, upper in ranges:
@@ -133,38 +134,41 @@ class TrafficLightDetector:
             # morphological cleaning to reduce noise and merge nearby small regions
             if mask is None:
                 continue
+
             kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
             mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
-            mask = cv2.dilate(mask, kernel, iterations=2)
+            mask = cv2.dilate(mask, kernel, iterations=1)
 
             # allow detection of very small blobs by also clustering non-zero points
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            if not contours:
-                # try to find sparse points and cluster them
-                pts = cv2.findNonZero(mask)
-                if pts is not None and len(pts) > 3:
-                    x, y, w, h = cv2.boundingRect(pts)
-                    contours = [np.array([[x, y], [x + w, y], [x + w, y + h], [x, y + h]])]
+
+            # if not contours:
+            #     # try to find sparse points and cluster them
+            #     pts = cv2.findNonZero(mask)
+            #     if pts is not None and len(pts) > 3:
+            #         x, y, w, h = cv2.boundingRect(pts)
+            #         contours = [np.array([[x, y], [x + w, y], [x + w, y + h], [x, y + h]])]
+
             for contour in contours:
                 x, y, w, h = cv2.boundingRect(contour)
                 area = float(w * h)
                 # accept very small blobs for fallback (distant lights)
-                if area <= 4.0:
+                if area <= 15.0 or area > 4000.0:
                     continue
-                if area > best_area:
-                    best_area = area
-                    best_detection = (x, y, w, h, label)
 
-        if best_detection is None:
-            return []
+                aspect_ratio = h / max(w, 1)
+                if aspect_ratio < 0.5 or aspect_ratio > 6.0:
+                    continue
+                
+                abs_xmin = float(roi_x_start + x)
+                abs_ymin = float(y)
+                abs_xmax = float(roi_x_start + x + w)
+                abs_ymax = float(y + h)
 
-        x, y, w, h, label = best_detection
-        xmin = int(width * 0.2) + x
-        ymin = y
-        xmax = xmin + w
-        ymax = ymin + h
-        return [{
-            'box': [float(xmin), float(ymin), float(xmax), float(ymax)],
-            'conf': 0.35,
-            'class': label,
-        }]
+                all_detections.append({
+                    'box': [abs_xmin, abs_ymin, abs_xmax, abs_ymax],
+                    'conf': 0.35,  # assign a low confidence for fallback detections
+                    'class': label,
+                })
+
+        return all_detections
