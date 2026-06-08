@@ -1,159 +1,324 @@
 """
-Description: Entry-point for the Traffic Light Detection & Control application.
+Traffic-light detector - classical computer vision (no ML).
+
+Usage:
+
+  # Single image -> annotated image:
+  python main.py image data/sample-dayClip6/sample-dayClip6/frames/dayClip6--00198.jpg
+
+  # Folder of frames -> annotated frames written to output/:
+  python main.py folder data/sample-dayClip6/sample-dayClip6/frames
+
+  # Live playback window (frames played like a video, detections drawn live):
+  python main.py play data/sample-dayClip6/sample-dayClip6/frames --fps 20
+  python main.py play data/sample-dayClip6/sample-dayClip6 --fps 20   # also overlays GT
+
+  # Evaluate vs LISA CSV:
+  python main.py eval data/sample-dayClip6/sample-dayClip6
 """
-import glob
-import os
-import cv2
+
+from __future__ import annotations
+
+import argparse
 import sys
 import time
-from src.preprocessing import apply_gaussian_blur
-from src.detection import TrafficLightDetector
-from src.tracking import TrafficLightTracker
-from src.control import VehicleControlUnit
+from pathlib import Path
 
-def main():
-    # -------------------------------------------------------------------------
-    # DATA SOURCE — set one of the two variables below:
-    #   image_folder : folder with .png / .jpg images  (leave "" to use video)
-    #   video_file   : path to .mp4 / .avi file        (leave "" to use folder)
-    # -------------------------------------------------------------------------
-    image_folder = "data/dayTrain/dayTrain/dayClip3/frames"
-    video_file   = ""
+import cv2
 
-    image_paths = []
-    cap = None
+from src.detector import detect
+from src.tracker import Tracker
+from src.evaluate import FrameResult, Summary, evaluate_frame, load_annotations
+from src.visualize import draw_detections, draw_ground_truth
 
-    if image_folder:
-        # Use a single glob + extension filter to avoid duplicate paths on
-        # Windows (where glob("*.jpg") and glob("*.JPG") both match the same file).
-        all_files = glob.glob(os.path.join(image_folder, "*.*"))
-        seen = set()
-        for p in sorted(all_files):
-            norm = os.path.normcase(p)   # lowercase on Windows
-            if norm not in seen and p.lower().endswith(('.png', '.jpg', '.jpeg')):
-                seen.add(norm)
-                image_paths.append(p)
 
-    if not image_paths and not video_file:
-        for ext in ("*.mp4", "*.avi", "*.mov"):
-            found = glob.glob(os.path.join("data", "**", ext), recursive=True)
-            if found:
-                video_file = found[0]
-                print(f"Auto-detected video: {video_file}")
-                break
+OUT_DIR = Path("output")
+IMG_EXTS = {".jpg", ".jpeg", ".png"}
 
-    if not image_paths and not video_file:
-        print(f"Error: no images in '{image_folder}' and no video found.")
-        print("Set 'image_folder' or 'video_file' in main.py.")
-        sys.exit(1)
 
-    if video_file and not image_paths:
-        cap = cv2.VideoCapture(video_file)
-        if not cap.isOpened():
-            print(f"Error: cannot open video '{video_file}'.")
-            sys.exit(1)
-        print(f"Video mode: {video_file}")
+def _ensure_out_dir() -> None:
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    detector = TrafficLightDetector(model_path='yolov8n.pt')
-    tracker  = TrafficLightTracker()
-    vcu      = VehicleControlUnit()
 
-    vcu.max_distance      = 60.0
-    vcu.max_stop_distance = 5.0
-    vcu.area_ref          = 15000.0
-    vcu.stop_area_pixels  = 8000.0
+def _list_frames(folder: Path):
+    return sorted(f for f in folder.iterdir() if f.suffix.lower() in IMG_EXTS)
 
-    prev_control     = None
-    smoothing_alpha  = 0.40   # increased from 0.20 for more responsive transitions
-    stop_distance    = vcu.max_stop_distance
-    pause_duration   = 2.0
 
-    print(f"Starting simulation: {len(image_paths)} images. Press 'q' to exit.")
+# ---------------------------------------------------------------------------
+# image / folder / eval (as before)
+# ---------------------------------------------------------------------------
 
-    def frame_source():
-        if image_paths:
-            for img_path in image_paths:
-                f = cv2.imread(img_path)
-                if f is None:
-                    print(f"Warning: cannot read {img_path}. Skipping.")
-                    continue
-                yield f
-        else:
-            while True:
-                ret, f = cap.read()
-                if not ret:
-                    break
-                yield f
-            cap.release()
+def cmd_image(path: str) -> int:
+    img = cv2.imread(path)
+    if img is None:
+        print(f"Could not read image: {path}", file=sys.stderr)
+        return 1
+    dets = detect(img)
+    print(f"{path}: {len(dets)} detection(s)")
+    for d in dets:
+        print(f"  {d.label:>5}  bbox=({d.x1},{d.y1},{d.x2},{d.y2})  score={d.score:.3f}")
+    _ensure_out_dir()
+    out_path = OUT_DIR / (Path(path).stem + "_det.jpg")
+    cv2.imwrite(str(out_path), draw_detections(img, dets))
+    print(f"Saved {out_path}")
+    return 0
 
-    for frame in frame_source():
-        if frame is None:
+
+def cmd_folder(folder: str, limit=None) -> int:
+    p = Path(folder)
+    frames = _list_frames(p)
+    if limit:
+        frames = frames[:limit]
+    _ensure_out_dir()
+    sub = OUT_DIR / p.name
+    sub.mkdir(parents=True, exist_ok=True)
+    total = 0
+    for f in frames:
+        img = cv2.imread(str(f))
+        if img is None:
+            continue
+        dets = detect(img)
+        total += len(dets)
+        cv2.imwrite(str(sub / f.name), draw_detections(img, dets))
+    print(f"Processed {len(frames)} frames, {total} detections. Output: {sub}")
+    return 0
+
+
+def cmd_eval(clip_dir: str, iou_threshold=0.3, save_examples=20, limit=None) -> int:
+    p = Path(clip_dir)
+    csv_path = p / "frameAnnotationsBOX.csv"
+    frames_dir = p / "frames"
+    if not csv_path.is_file() or not frames_dir.is_dir():
+        print(f"Expected {csv_path} and {frames_dir}", file=sys.stderr)
+        return 1
+
+    gts_by_frame = load_annotations(str(csv_path))
+    frame_files = _list_frames(frames_dir)
+    if limit:
+        frame_files = frame_files[:limit]
+
+    summary = Summary()
+    _ensure_out_dir()
+    examples_dir = OUT_DIR / (p.name + "_examples")
+    examples_dir.mkdir(parents=True, exist_ok=True)
+
+    saved = 0
+    for f in frame_files:
+        img = cv2.imread(str(f))
+        if img is None:
+            continue
+        dets = detect(img)
+        gts = gts_by_frame.get(f.name, [])
+        summary.add(evaluate_frame(dets, gts, iou_threshold))
+        if saved < save_examples and (dets or gts):
+            vis = draw_ground_truth(img, [(g.x1, g.y1, g.x2, g.y2, g.label) for g in gts])
+            vis = draw_detections(vis, dets)
+            cv2.imwrite(str(examples_dir / f.name), vis)
+            saved += 1
+
+    print(f"Clip: {p.name}")
+    print(f"Frames evaluated: {len(frame_files)}")
+    print(f"IoU threshold: {iou_threshold}")
+    print(summary)
+    print(f"Sample annotated frames: {examples_dir}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Live playback window
+# ---------------------------------------------------------------------------
+
+def _resolve_play_paths(path: str):
+    """
+    Accept either a frames folder, or a clip folder containing
+    frames/ + frameAnnotationsBOX.csv (so GT can be overlaid).
+
+    Returns (frames_dir: Path, gts_by_frame: dict or None, clip_label: str)
+    """
+    p = Path(path)
+    if p.is_dir() and p.name == "frames":
+        return p, None, p.parent.name
+    csv_path = p / "frameAnnotationsBOX.csv"
+    frames_dir = p / "frames"
+    if frames_dir.is_dir() and csv_path.is_file():
+        return frames_dir, load_annotations(str(csv_path)), p.name
+    if frames_dir.is_dir():
+        return frames_dir, None, p.name
+    if p.is_dir():
+        return p, None, p.name
+    raise FileNotFoundError(f"Cannot find frames in {path}")
+
+
+def _hud(img, text, y=24):
+    """Draw a small heads-up overlay (top-left)."""
+    (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
+    cv2.rectangle(img, (8, y - th - 6), (8 + tw + 10, y + 6), (0, 0, 0), -1)
+    cv2.putText(img, text, (13, y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+
+
+def cmd_play(path: str, fps: float = 15.0, loop: bool = False,
+             show_gt: bool = True, scale: float = 1.0,
+             smooth: bool = True) -> int:
+    """
+    Open a window and play frames in order, drawing detections (and
+    ground-truth, if available) in real time.
+
+    Keyboard:
+      q / ESC  -> quit
+      space    -> pause / resume
+      n / .    -> next frame (while paused)
+      p / ,    -> previous frame (while paused)
+      +/-      -> faster / slower
+      g        -> toggle ground-truth boxes
+      s        -> save current annotated frame
+    """
+    frames_dir, gts_by_frame, clip_label = _resolve_play_paths(path)
+    frames = _list_frames(frames_dir)
+    if not frames:
+        print(f"No frames in {frames_dir}", file=sys.stderr)
+        return 1
+
+    win = f"traffic-light-detection : {clip_label}"
+    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+
+    idx = 0
+    paused = False
+    last_t = time.time()
+    tracker = Tracker(min_hits=2, max_age=4, match_dist=40) if smooth else None
+    delay_ms = max(1, int(1000.0 / max(fps, 1.0)))
+    _ensure_out_dir()
+    print(f"Playing {len(frames)} frames from {frames_dir}")
+    print("Keys: [space] pause  [n/p] step  [+/-] speed  [g] GT  "
+          "[s] save  [q/ESC] quit")
+
+    while True:
+        f = frames[idx]
+        img = cv2.imread(str(f))
+        if img is None:
+            idx = (idx + 1) % len(frames)
             continue
 
-        blurred_frame = apply_gaussian_blur(frame, kernel_size=(5, 5))
-        detections    = detector.detect(blurred_frame, confidence_threshold=0.35)
+        t0 = time.time()
+        raw_dets = detect(img)
+        dets = tracker.update(raw_dets) if tracker is not None else raw_dets
+        det_ms = (time.time() - t0) * 1000.0
 
-        # Select the relevant light BEFORE tracking so Kalman follows the correct object
-        target_light = vcu.select_relevant_traffic_light(detections, lane_info={'image_shape': frame.shape})
+        vis = img
+        if show_gt and gts_by_frame is not None:
+            gts = gts_by_frame.get(f.name, [])
+            vis = draw_ground_truth(vis, [(g.x1, g.y1, g.x2, g.y2, g.label) for g in gts])
+        vis = draw_detections(vis, dets)
 
-        tracker.predict()
-        if target_light is not None:
-            cx, cy, w, h = tracker.update(target_light['box'])
-            target_light['box'] = [cx - w/2, cy - h/2, cx + w/2, cy + h/2]
+        now = time.time()
+        inst_fps = 1.0 / max(now - last_t, 1e-6)
+        last_t = now
 
-        control_payload = vcu.generate_command(target_light)
+        red_n = sum(1 for d in dets if d.label == "red")
+        green_n = sum(1 for d in dets if d.label == "green")
+        _hud(vis,
+             f"{f.name}  frame {idx+1}/{len(frames)}  "
+             f"red={red_n} green={green_n}  "
+             f"det={det_ms:.0f}ms  fps={inst_fps:.1f}  "
+             f"{'PAUSED' if paused else f'target {fps:.0f}fps'}")
 
-        if prev_control is None:
-            prev_control = control_payload.copy()
+        if scale != 1.0:
+            h, w = vis.shape[:2]
+            vis = cv2.resize(vis, (int(w * scale), int(h * scale)))
+        cv2.imshow(win, vis)
+
+        key = cv2.waitKey(0 if paused else delay_ms) & 0xFF
+        if key in (ord('q'), 27):                  # q / ESC
+            break
+        elif key == ord(' '):                      # pause
+            paused = not paused
+        elif key in (ord('n'), ord('.')):          # next
+            idx = min(idx + 1, len(frames) - 1)
+            paused = True
+        elif key in (ord('p'), ord(',')):          # prev
+            idx = max(idx - 1, 0)
+            paused = True
+            if tracker is not None:
+                tracker.reset()
+        elif key in (ord('+'), ord('=')):
+            fps = min(fps * 1.5, 120.0)
+            delay_ms = max(1, int(1000.0 / fps))
+        elif key == ord('-'):
+            fps = max(fps / 1.5, 1.0)
+            delay_ms = max(1, int(1000.0 / fps))
+        elif key == ord('g'):
+            show_gt = not show_gt
+        elif key == ord('s'):
+            out = OUT_DIR / f"snapshot_{f.stem}.jpg"
+            cv2.imwrite(str(out), vis)
+            print(f"Saved {out}")
         else:
-            th = prev_control.get('throttle', 0.0) * (1 - smoothing_alpha) + control_payload.get('throttle', 0.0) * smoothing_alpha
-            br = prev_control.get('brake',    0.0) * (1 - smoothing_alpha) + control_payload.get('brake',    0.0) * smoothing_alpha
-            control_payload['throttle'] = float(th)
-            control_payload['brake']    = float(br)
-            prev_control = control_payload.copy()
+            if not paused:
+                idx += 1
+                if idx >= len(frames):
+                    if loop:
+                        idx = 0
+                    else:
+                        break
 
-        try:
-            close_dist = float(control_payload.get('distance_to_light', float('inf')))
-        except Exception:
-            close_dist = float('inf')
-
-        is_stop = control_payload.get('action') == 'STOP' and close_dist <= stop_distance
-
-        if is_stop:
-            print("STOP")
-            control_payload['action']   = 'STOP'
-            control_payload['throttle'] = 0.0
-            control_payload['brake']    = 1.0
-            cv2.putText(frame, "STOP",
-                        (frame.shape[1]//2 - 120, frame.shape[0]//2),
-                        cv2.FONT_HERSHEY_SIMPLEX, 2.5, (0, 0, 255), 6)
-
-        # Draw all detections
-        for det in detections:
-            xmin, ymin, xmax, ymax = map(int, det['box'])
-            label = f"{det['class']} ({det['conf']:.2f})"
-            cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), (0, 255, 0), 2)
-            cv2.putText(frame, label, (xmin, max(0, ymin - 10)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-
-        action_text    = f"ACTION: {control_payload['action']}"
-        telemetry_text = (f"Throttle: {control_payload['throttle']:.2f}, "
-                          f"Brake: {control_payload['brake']:.2f}, "
-                          f"Handbrake: {control_payload['handbrake']}, "
-                          f"Dist: {control_payload['distance_to_light']:.2f}m")
-
-        color = (0, 0, 255) if "STOP" in action_text else (0, 255, 0)
-        cv2.putText(frame, action_text,    (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1,   color,           3)
-        cv2.putText(frame, telemetry_text, (30, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-
-        cv2.imshow("Traffic Light Detection", frame)
-
-        wait_ms = int(pause_duration * 1000) if is_stop else 25
-        if cv2.waitKey(wait_ms) & 0xFF == ord('q'):
-            print("Exiting.")
+        # Window closed by user (X button)?
+        if cv2.getWindowProperty(win, cv2.WND_PROP_VISIBLE) < 1:
             break
 
     cv2.destroyAllWindows()
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_img = sub.add_parser("image", help="Run detector on a single image")
+    p_img.add_argument("path")
+
+    p_fld = sub.add_parser("folder", help="Run detector on a folder of frames")
+    p_fld.add_argument("path")
+    p_fld.add_argument("--limit", type=int, default=None)
+
+    p_ply = sub.add_parser("play", help="Play frames in a window with live detections")
+    p_ply.add_argument("path",
+                       help="Path to a frames/ folder OR a clip folder "
+                            "(containing frames/ and frameAnnotationsBOX.csv)")
+    p_ply.add_argument("--fps", type=float, default=15.0,
+                       help="Target playback FPS (default 15)")
+    p_ply.add_argument("--loop", action="store_true",
+                       help="Loop back to start after the last frame")
+    p_ply.add_argument("--no-gt", action="store_true",
+                       help="Don't draw ground-truth boxes even if CSV is found")
+    p_ply.add_argument("--scale", type=float, default=1.0,
+                       help="Window scale (e.g. 0.75 for smaller, 1.5 for bigger)")
+    p_ply.add_argument("--no-smooth", action="store_true",
+                       help="Disable temporal smoothing (raw per-frame detections)")
+
+    p_ev = sub.add_parser("eval", help="Evaluate against a LISA clip's CSV")
+    p_ev.add_argument("clip_dir")
+    p_ev.add_argument("--iou", type=float, default=0.3)
+    p_ev.add_argument("--examples", type=int, default=20)
+    p_ev.add_argument("--limit", type=int, default=None)
+
+    args = parser.parse_args(argv)
+    if args.cmd == "image":
+        return cmd_image(args.path)
+    if args.cmd == "folder":
+        return cmd_folder(args.path, args.limit)
+    if args.cmd == "play":
+        return cmd_play(args.path, args.fps, args.loop,
+                        show_gt=not args.no_gt, scale=args.scale,
+                        smooth=not args.no_smooth)
+    if args.cmd == "eval":
+        return cmd_eval(args.clip_dir, args.iou, args.examples, args.limit)
+    return 1
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
